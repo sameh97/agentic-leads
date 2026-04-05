@@ -1,0 +1,129 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# LeadFlow — Docker Compose
+#
+# Services:
+#   backend   — FastAPI + LangGraph  (port 8000)
+#   frontend  — Next.js 14           (port 3000)
+#
+# Shared volume:
+#   leads_output — CSV/XLSX files written by backend,
+#                  mounted read-only by frontend for direct serving
+#
+# Usage:
+#   cp .env.example .env          # fill in API keys
+#   docker compose up --build     # first run (builds images)
+#   docker compose up             # subsequent runs (uses cache)
+#   docker compose down -v        # stop + remove volumes
+# ─────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Backend ────────────────────────────────────────────────
+  backend:
+    build:
+      context:    ./backend
+      dockerfile: Dockerfile
+    image: leadflow-backend:latest
+    container_name: leadflow-backend
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      # LLM
+      OPENAI_API_KEY:        ${OPENAI_API_KEY}
+
+      # Maps scraping
+      OUTSCRAPER_API_KEY:    ${OUTSCRAPER_API_KEY:-}
+      GOOGLE_PLACES_API_KEY: ${GOOGLE_PLACES_API_KEY:-}
+
+      # Email enrichment
+      HUNTER_API_KEY:        ${HUNTER_API_KEY:-}
+      APOLLO_API_KEY:        ${APOLLO_API_KEY:-}
+
+      # Email verification
+      ZEROBOUNCE_API_KEY:    ${ZEROBOUNCE_API_KEY:-}
+      NEVER_BOUNCE_API_KEY:  ${NEVER_BOUNCE_API_KEY:-}
+
+      # App config
+      OUTPUT_DIR:            /app/output
+      PORT:                  8000
+
+    volumes:
+      # Persist exported lead files between restarts
+      - leads_output:/app/output
+
+    networks:
+      - leadflow_net
+
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  5
+      start_period: 20s
+
+    # Resource limits (tune for your server)
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus:   "1.0"
+
+
+  # ── Frontend ───────────────────────────────────────────────
+  frontend:
+    build:
+      context:    ./frontend
+      dockerfile: Dockerfile
+      args:
+        # API URL seen by the BROWSER (public-facing)
+        # In production set this to your domain, e.g. https://api.leadflow.io
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    image: leadflow-frontend:latest
+    container_name: leadflow-frontend
+    restart: unless-stopped
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      # Internal URL for Next.js API rewrites (server-side)
+      # Uses Docker internal DNS — "backend" resolves to the backend container
+      BACKEND_URL: http://backend:8000
+      NODE_ENV:    production
+
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    networks:
+      - leadflow_net
+
+    healthcheck:
+      test:     ["CMD", "wget", "-qO-", "http://localhost:3000"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus:   "0.5"
+
+
+# ── Shared network ─────────────────────────────────────────
+networks:
+  leadflow_net:
+    driver: bridge
+
+
+# ── Named volumes ──────────────────────────────────────────
+volumes:
+  leads_output:
+    driver: local
