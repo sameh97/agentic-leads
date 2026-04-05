@@ -1,51 +1,43 @@
 """
-FastAPI Server
-==============
-Endpoints:
-  POST /api/leads/generate   — start a lead generation job
-  GET  /api/leads/stream/{job_id} — SSE stream of node-by-node progress
-  GET  /api/leads/download/{job_id} — download the CSV/XLSX result
-  GET  /api/leads/status/{job_id}  — check job status (JSON)
+FastAPI entrypoint
+==================
+POST /api/leads/generate          → start job, returns job_id
+GET  /api/leads/stream/{job_id}   → SSE live progress
+GET  /api/leads/status/{job_id}   → JSON polling fallback
+GET  /api/leads/download/{job_id} → file download (?format=csv|xlsx)
+GET  /api/health                  → health check
 """
-
-import os
-import uuid
-import asyncio
-import json
-import logging
+import os, uuid, asyncio, json, logging
+from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator
-from datetime import datetime
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
-from app.agents.graph import lead_graph, LeadState
+from app.agents.graph import lead_graph
+from app.agents.state import LeadState
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(
-    title="Prompt-to-Leads API",
-    description="Natural Language → Verified Sales Leads via LangGraph",
-    version="1.0.0",
-)
+app = FastAPI(title="Prompt-to-Leads API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", os.getenv("FRONTEND_URL", "*")],
+    allow_origins=["*"],   # tighten in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory job store (use Redis in production)
+# ── In-memory job store (swap for Redis in prod) ──────────────────────────────
 jobs: dict[str, dict] = {}
 
 
-# ── Request / Response models ─────────────────────────────────────────────────
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
     query:       str
@@ -53,233 +45,181 @@ class GenerateRequest(BaseModel):
     max_retries: int = 3
 
 
-class JobResponse(BaseModel):
-    job_id:    str
-    status:    str
-    message:   str
+class JobCreated(BaseModel):
+    job_id:     str
     stream_url: str
+    status_url: str
 
 
-# ── Background job runner ─────────────────────────────────────────────────────
+# ── Background task ───────────────────────────────────────────────────────────
 
-async def run_lead_job(job_id: str, query: str, max_results: int, max_retries: int):
-    """Runs the LangGraph pipeline and emits progress events."""
+async def _run_job(job_id: str, req: GenerateRequest):
     job = jobs[job_id]
 
-    def emit(node: str, data: dict):
-        event = {
-            "node":      node,
-            "timestamp": datetime.utcnow().isoformat(),
-            **data,
-        }
+    def push(node: str, **data):
+        event = {"node": node, "ts": datetime.utcnow().isoformat(), **data}
         job["events"].append(event)
-        logger.info(f"[job:{job_id}] {node}: {data}")
 
     try:
-        emit("start", {"message": f"Starting pipeline for: {query}"})
+        job["status"] = "running"
+        push("start", message=f'Starting: "{req.query}"')
 
-        initial_state: LeadState = {
-            "messages":          [],
-            "raw_query":         query,
-            "business_type":     "",
-            "location":          "",
-            "radius_km":         25.0,
-            "enrichment_reqs":   [],
-            "raw_businesses":    [],
-            "scrape_errors":     [],
-            "enriched_leads":    [],
-            "enrichment_errors": [],
-            "verified_leads":    [],
-            "verification_errors": [],
-            "scored_leads":      [],
-            "final_csv_path":    "",
-            "retry_count":       0,
-            "max_retries":       max_retries,
-            "status":            "running",
-            "error_message":     "",
+        initial: LeadState = {
+            "messages": [], "raw_query": req.query,
+            "business_type": "", "location": "", "radius_km": 25.0,
+            "enrichment_reqs": [], "max_results": req.max_results,
+            "raw_businesses": [], "scrape_errors": [],
+            "enriched_leads": [], "enrichment_errors": [],
+            "verified_leads": [], "verification_errors": [],
+            "scored_leads": [], "final_csv_path": "", "final_xlsx_path": "",
+            "retry_count": 0, "max_retries": req.max_retries,
+            "status": "running", "error_message": "",
         }
 
-        # Stream node-by-node updates
         loop = asyncio.get_event_loop()
-        final_state = None
+        final = None
 
-        # LangGraph streaming: yields (node_name, output_state) tuples
-        for chunk in lead_graph.stream(
-            initial_state,
-            config={"configurable": {"thread_id": job_id}},
-        ):
-            for node_name, node_state in chunk.items():
+        # Run synchronous LangGraph in thread pool so we don't block
+        def _run():
+            return list(lead_graph.stream(initial, config={"configurable": {"thread_id": job_id}}))
+
+        chunks = await loop.run_in_executor(None, _run)
+
+        for chunk in chunks:
+            for node_name, s in chunk.items():
                 if node_name == "parse_query":
-                    emit("parse_query", {
-                        "message": "Query parsed",
-                        "business_type": node_state.get("business_type"),
-                        "location":      node_state.get("location"),
-                        "radius_km":     node_state.get("radius_km"),
-                    })
+                    push("parse_query",
+                         message="Query understood",
+                         business_type=s.get("business_type"),
+                         location=s.get("location"),
+                         radius_km=s.get("radius_km"))
+
                 elif node_name == "scrape_maps":
-                    count = len(node_state.get("raw_businesses", []))
-                    emit("scrape_maps", {
-                        "message": f"Scraped {count} businesses from Google Maps",
-                        "count": count,
-                    })
+                    n = len(s.get("raw_businesses", []))
+                    push("scrape_maps", message=f"Found {n} businesses on Google Maps", count=n)
+
                 elif node_name == "enrich_websites":
-                    count = len(node_state.get("enriched_leads", []))
-                    emit("enrich_websites", {
-                        "message": f"Enriched {count} businesses with email addresses",
-                        "count": count,
-                    })
+                    n = len(s.get("enriched_leads", []))
+                    push("enrich_websites", message=f"Enriched {n} businesses with emails", count=n)
+
                 elif node_name == "verify_emails":
-                    leads = node_state.get("verified_leads", [])
-                    valid = sum(1 for l in leads if l.get("email_valid"))
-                    emit("verify_emails", {
-                        "message": f"Verified {valid}/{len(leads)} emails",
-                        "verified_count": valid,
-                        "total": len(leads),
-                    })
+                    vl  = s.get("verified_leads", [])
+                    ok  = sum(1 for l in vl if l.get("email_valid"))
+                    push("verify_emails",
+                         message=f"Verified {ok}/{len(vl)} emails as deliverable",
+                         verified=ok, total=len(vl))
+
                 elif node_name == "score_leads":
-                    leads = node_state.get("scored_leads", [])
-                    high  = sum(1 for l in leads if l.get("score", 0) >= 70)
-                    emit("score_leads", {
-                        "message": f"Scored {len(leads)} leads — {high} high-quality",
-                        "total":  len(leads),
-                        "high_quality": high,
-                    })
+                    sl   = s.get("scored_leads", [])
+                    high = sum(1 for l in sl if l.get("score", 0) >= 70)
+                    push("score_leads",
+                         message=f"Scored {len(sl)} leads — {high} high-quality",
+                         total=len(sl), high_quality=high,
+                         preview=[{k: l.get(k) for k in
+                                   ("name","primary_email","score","rating","review_count")}
+                                  for l in sl[:5]])
+
                 elif node_name == "deliver":
-                    emit("deliver", {
-                        "message":    "Files ready for download",
-                        "csv_path":   node_state.get("final_csv_path"),
-                        "xlsx_path":  node_state.get("final_xlsx_path"),
-                    })
-                    final_state = node_state
+                    push("deliver",
+                         message="Files ready for download",
+                         csv_url=f"/api/leads/download/{job_id}?format=csv",
+                         xlsx_url=f"/api/leads/download/{job_id}?format=xlsx")
+                    final = s
+
                 elif node_name == "fail":
-                    emit("error", {
-                        "message": node_state.get("error_message", "Pipeline failed"),
-                    })
+                    push("fail", message=s.get("error_message", "Pipeline failed"))
                     job["status"] = "failed"
                     return
 
-        if final_state:
-            job["status"]         = "done"
-            job["csv_path"]       = final_state.get("final_csv_path", "")
-            job["xlsx_path"]      = final_state.get("final_xlsx_path", "")
-            job["lead_count"]     = len(final_state.get("scored_leads", []))
-            job["final_state"]    = final_state
-            emit("done", {
-                "message":    f"Done! {job['lead_count']} verified leads ready.",
-                "lead_count": job["lead_count"],
-                "csv_url":    f"/api/leads/download/{job_id}?format=csv",
-                "xlsx_url":   f"/api/leads/download/{job_id}?format=xlsx",
-            })
+        if final:
+            job["status"]     = "done"
+            job["csv_path"]   = final.get("final_csv_path", "")
+            job["xlsx_path"]  = final.get("final_xlsx_path", "")
+            job["lead_count"] = len(final.get("scored_leads", []))
+            job["preview"]    = [{k: l.get(k) for k in
+                                   ("name","primary_email","score","rating","review_count",
+                                    "address","phone","email_verified","email_status","owner_name")}
+                                  for l in final.get("scored_leads", [])[:20]]
+            push("done",
+                 message=f'{job["lead_count"]} verified leads ready!',
+                 lead_count=job["lead_count"],
+                 csv_url=f"/api/leads/download/{job_id}?format=csv",
+                 xlsx_url=f"/api/leads/download/{job_id}?format=xlsx")
 
     except Exception as e:
-        logger.exception(f"[job:{job_id}] Unhandled error: {e}")
+        logger.exception(f"[job {job_id}] Fatal: {e}")
         job["status"] = "failed"
-        job["events"].append({
-            "node":      "error",
-            "timestamp": datetime.utcnow().isoformat(),
-            "message":   str(e),
-        })
+        job["events"].append({"node": "fail", "ts": datetime.utcnow().isoformat(),
+                               "message": str(e)})
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@app.post("/api/leads/generate", response_model=JobResponse)
-async def generate_leads(req: GenerateRequest, background_tasks: BackgroundTasks):
-    """Start a lead generation job. Returns job_id immediately."""
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        "id":      job_id,
-        "query":   req.query,
-        "status":  "queued",
-        "events":  [],
-        "csv_path": "",
-        "xlsx_path": "",
-        "lead_count": 0,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    background_tasks.add_task(
-        run_lead_job, job_id, req.query, req.max_results, req.max_retries
-    )
-    return JobResponse(
-        job_id=job_id,
-        status="queued",
-        message="Job started. Connect to stream_url for live updates.",
-        stream_url=f"/api/leads/stream/{job_id}",
+@app.post("/api/leads/generate", response_model=JobCreated)
+async def generate(req: GenerateRequest, bg: BackgroundTasks):
+    jid = str(uuid.uuid4())
+    jobs[jid] = {"id": jid, "query": req.query, "status": "queued",
+                  "events": [], "csv_path": "", "xlsx_path": "",
+                  "lead_count": 0, "preview": [],
+                  "created_at": datetime.utcnow().isoformat()}
+    bg.add_task(_run_job, jid, req)
+    return JobCreated(
+        job_id=jid,
+        stream_url=f"/api/leads/stream/{jid}",
+        status_url=f"/api/leads/status/{jid}",
     )
 
 
 @app.get("/api/leads/stream/{job_id}")
-async def stream_job(job_id: str):
-    """Server-Sent Events stream — frontend polls this for live progress."""
+async def stream(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        job = jobs[job_id]
-        last_idx = 0
-
+    async def gen() -> AsyncGenerator[str, None]:
+        job, seen = jobs[job_id], 0
         while True:
-            events = job["events"][last_idx:]
-            for event in events:
-                yield f"data: {json.dumps(event)}\n\n"
-                last_idx += 1
-
+            for ev in job["events"][seen:]:
+                yield f"data: {json.dumps(ev)}\n\n"
+                seen += 1
             if job["status"] in ("done", "failed"):
-                yield f"data: {json.dumps({'node': 'end', 'status': job['status']})}\n\n"
+                yield f"data: {json.dumps({'node':'end','status':job['status']})}\n\n"
                 break
+            await asyncio.sleep(0.4)
 
-            await asyncio.sleep(0.5)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control":               "no-cache",
-            "X-Accel-Buffering":           "no",
-            "Access-Control-Allow-Origin": "*",
-        },
-    )
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/leads/status/{job_id}")
-async def job_status(job_id: str):
-    """Polling fallback for clients that don't support SSE."""
+async def status(job_id: str):
     if job_id not in jobs:
-        raise HTTPException(404, "Job not found")
-    job = jobs[job_id]
-    return {
-        "job_id":     job_id,
-        "status":     job["status"],
-        "lead_count": job.get("lead_count", 0),
-        "events":     job["events"],
-        "csv_url":    f"/api/leads/download/{job_id}?format=csv"  if job["status"] == "done" else None,
-        "xlsx_url":   f"/api/leads/download/{job_id}?format=xlsx" if job["status"] == "done" else None,
-    }
+        raise HTTPException(404)
+    j = jobs[job_id]
+    return {**j, "csv_url": f"/api/leads/download/{job_id}?format=csv" if j["status"] == "done" else None,
+            "xlsx_url": f"/api/leads/download/{job_id}?format=xlsx" if j["status"] == "done" else None}
 
 
 @app.get("/api/leads/download/{job_id}")
-async def download_leads(job_id: str, format: str = "csv"):
-    """Download the final lead file."""
+async def download(job_id: str, format: str = "csv"):
     if job_id not in jobs:
-        raise HTTPException(404, "Job not found")
+        raise HTTPException(404)
+    j = jobs[job_id]
+    if j["status"] != "done":
+        raise HTTPException(400, f"Job not complete (status: {j['status']})")
 
-    job = jobs[job_id]
-    if job["status"] != "done":
-        raise HTTPException(400, f"Job not complete (status: {job['status']})")
+    if format == "xlsx" and j.get("xlsx_path"):
+        p = Path(j["xlsx_path"])
+        if p.exists():
+            return FileResponse(p, filename=p.name,
+                                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    if format == "xlsx" and job.get("xlsx_path"):
-        path = Path(job["xlsx_path"])
-        if path.exists():
-            return FileResponse(path, filename=path.name, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    # Default to CSV
-    path = Path(job["csv_path"])
-    if not path.exists():
-        raise HTTPException(500, "Output file not found")
-
-    return FileResponse(path, filename=path.name, media_type="text/csv")
+    p = Path(j["csv_path"])
+    if not p.exists():
+        raise HTTPException(500, "File not found")
+    return FileResponse(p, filename=p.name, media_type="text/csv")
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "jobs_in_memory": len(jobs)}
