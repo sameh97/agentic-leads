@@ -1,42 +1,47 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
-*.egg
-
-# Testing / coverage
-htmlcov/
-.coverage
-.coverage.*
-coverage/
-.pytest_cache/
-
-# Type checking
-.mypy_cache/
-
-# Virtual environments
-.venv
-env/
-venv/
-
-# IDE
+# ==========================================
+# OS / IDE (Global)
+# ==========================================
+.DS_Store
+Thumbs.db
 .vscode/
 .idea/
 
-# OS
-.DS_Store
-Thumbs.db
+# ==========================================
+# Backend (Python/FastAPI/uv)
+# ==========================================
+backend/__pycache__/
+backend/*.py[cod]
+backend/*$py.class
+backend/*.so
+backend/.venv/
+backend/env/
+backend/venv/
+backend/.uv/
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.coverage
+backend/htmlcov/
+backend/*.db
 
-# FastAPI specific (if applicable)
+# ==========================================
+# Frontend (Next.js/Node)
+# ==========================================
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+frontend/*.tsbuildinfo
+frontend/next-env.d.ts
+frontend/npm-debug.log*
+
+# ==========================================
+# Environment Secrets (Crucial!)
+# ==========================================
+# This catches .env files in the root, frontend, and backend
 .env
-*.db
+.env*.local
+**/.env
+**/.env.local
 
 
-# uv
-.uv/
+.env.example
