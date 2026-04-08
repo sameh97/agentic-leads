@@ -1,0 +1,9 @@
+# frontend/.dockerignore
+node_modules
+.next
+.git
+*.log
+.env*
+coverage
+.turbo
+out
