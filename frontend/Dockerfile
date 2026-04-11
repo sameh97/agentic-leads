@@ -23,6 +23,10 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
+# Remove any .mjs postcss config that create-next-app may have generated
+# — it conflicts with our CommonJS postcss.config.js
+RUN rm -f postcss.config.mjs
+
 # NEXT_PUBLIC_ vars must be available at build time
 ARG NEXT_PUBLIC_API_URL=http://localhost:8000
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL

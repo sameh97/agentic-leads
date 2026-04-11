@@ -1,19 +1,27 @@
 /** @type {import('next').NextConfig} */
+const path = require('path')
+
 const nextConfig = {
-  // Required for the Docker multi-stage build (copies only what's needed)
+  // Required for the Docker multi-stage build
   output: 'standalone',
 
-  // Proxy API requests to backend so frontend never exposes the backend URL
+  // Tell Next.js where src lives — fixes @/ alias in Docker builds
+  webpack(config) {
+    config.resolve.alias['@'] = path.resolve(__dirname, 'src')
+    return config
+  },
+
+  // Proxy /api/* → backend container (server-side only)
   async rewrites() {
     return [
       {
         source:      '/api/:path*',
         destination: `${process.env.BACKEND_URL || 'http://backend:8000'}/api/:path*`,
       },
-    ];
+    ]
   },
 
-  // Required for SSE (Server-Sent Events) — disable response buffering
+  // Disable buffering for SSE endpoints
   async headers() {
     return [
       {
@@ -23,8 +31,8 @@ const nextConfig = {
           { key: 'Cache-Control',      value: 'no-cache' },
         ],
       },
-    ];
+    ]
   },
-};
+}
 
-module.exports = nextConfig;
+module.exports = nextConfig
