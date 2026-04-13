@@ -1,10 +1,10 @@
 """
 Node 3 — Email Enricher
 ========================
-Waterfall (free → paid → paid):
-  1. Website scrape      — BeautifulSoup, free
-  2. Hunter.io           — domain search, ~$0.005/call
-  3. Apollo.io           — people search, ~$0.01/call
+Waterfall (free → free → paid):
+  1. Check if RapidAPI Local Business Data already returned an email (free, already done)
+  2. Website scrape (BeautifulSoup, completely free)
+  3. RapidAPI Email Finder (rapidapi.com/theCele/api/email-finder7)
 """
 import os, re, logging, asyncio
 from urllib.parse import urljoin, urlparse
@@ -14,18 +14,19 @@ from app.agents.state import LeadState
 
 logger = logging.getLogger(__name__)
 
-HUNTER_KEY = os.getenv("HUNTER_API_KEY", "")
-APOLLO_KEY  = os.getenv("APOLLO_API_KEY", "")
-
+RAPIDAPI_KEY  = os.getenv("RAPIDAPI_KEY", "")
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-DECISION_KWS = {"owner", "ceo", "founder", "president", "director", "manager"}
-GENERIC_PFX  = {"info", "contact", "hello", "support", "admin", "noreply",
-                 "no-reply", "sales", "office", "team", "enquiries"}
-
+DECISION_KWS  = {"owner", "ceo", "founder", "president", "director", "manager"}
+GENERIC_PFX   = {"info", "contact", "hello", "support", "admin", "noreply",
+                  "no-reply", "sales", "office", "team", "enquiries"}
 UA = "Mozilla/5.0 (compatible; LeadBot/1.0)"
 
 
-# ── Layer 1: website scrape ───────────────────────────────────────────────────
+# ── Layer 1: already in RapidAPI response ─────────────────────────────────────
+# (handled in maps_scraper — if primary_email already set, we skip enrichment)
+
+
+# ── Layer 2: website scrape ───────────────────────────────────────────────────
 
 async def _scrape_site(url: str) -> list[str]:
     if not url:
@@ -53,61 +54,45 @@ async def _scrape_site(url: str) -> list[str]:
     return [e for e in found if "@" in e and not e.endswith((".png", ".jpg", ".css"))]
 
 
-# ── Layer 2: Hunter.io ────────────────────────────────────────────────────────
+# ── Layer 3: RapidAPI Email Finder ────────────────────────────────────────────
 
-async def _hunter(domain: str) -> list[dict]:
-    if not HUNTER_KEY or not domain:
+async def _rapidapi_email_finder(domain: str, company: str) -> list[dict]:
+    """
+    RapidAPI Email Finder by theCele
+    https://rapidapi.com/theCele/api/email-finder7
+    """
+    if not RAPIDAPI_KEY or not domain:
         return []
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(
-                "https://api.hunter.io/v2/domain-search",
-                params={"domain": domain, "api_key": HUNTER_KEY, "limit": 10},
-            )
-            if r.status_code == 200:
-                return r.json().get("data", {}).get("emails", [])
-    except Exception as e:
-        logger.warning(f"[hunter] {domain}: {e}")
-    return []
-
-
-# ── Layer 3: Apollo.io ────────────────────────────────────────────────────────
-
-async def _apollo(company: str, domain: str) -> list[dict]:
-    if not APOLLO_KEY or not domain:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.post(
-                "https://api.apollo.io/v1/mixed_people/search",
-                json={
-                    "api_key": APOLLO_KEY,
-                    "q_organization_name": company,
-                    "organization_domains": [domain],
-                    "person_titles": ["owner", "ceo", "founder", "president", "general manager"],
-                    "per_page": 5,
+                "https://email-finder7.p.rapidapi.com/find",
+                params={"domain": domain, "company": company},
+                headers={
+                    "X-RapidAPI-Key":  RAPIDAPI_KEY,
+                    "X-RapidAPI-Host": "email-finder7.p.rapidapi.com",
                 },
             )
             if r.status_code == 200:
-                return [
-                    {"value": p["email"], "first_name": p.get("first_name", ""),
-                     "last_name": p.get("last_name", ""), "position": p.get("title", ""),
-                     "confidence": 70}
-                    for p in r.json().get("people", []) if p.get("email")
-                ]
+                data = r.json()
+                emails = data.get("emails", []) or []
+                return [{"value": e if isinstance(e, str) else e.get("value",""),
+                         "position": e.get("position","") if isinstance(e, dict) else "",
+                         "confidence": e.get("confidence", 70) if isinstance(e, dict) else 70}
+                        for e in emails if e]
     except Exception as e:
-        logger.warning(f"[apollo] {company}: {e}")
+        logger.warning(f"[enricher] RapidAPI email finder failed for {domain}: {e}")
     return []
 
 
-# ── Scoring + selection ───────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _email_score(email: str, position: str = "") -> int:
     pfx = email.split("@")[0].lower()
     s = 50
-    if any(k in pfx for k in DECISION_KWS):      s += 30
+    if any(k in pfx      for k in DECISION_KWS): s += 30
     if any(k in position.lower() for k in DECISION_KWS): s += 20
-    if pfx in GENERIC_PFX:                        s -= 30
+    if pfx in GENERIC_PFX: s -= 30
     return max(0, min(100, s))
 
 
@@ -123,29 +108,29 @@ def _domain(website: str) -> str:
 
 
 async def _enrich_one(biz: dict) -> dict:
-    # Skip if demo already populated
-    if biz.get("primary_email") and biz.get("source") == "demo":
+    # Layer 0: already have email from RapidAPI maps response
+    if biz.get("primary_email") and biz.get("source") != "demo":
+        return {**biz, "enriched": True}
+
+    # Demo records already have emails
+    if biz.get("source") == "demo" and biz.get("primary_email"):
         return biz
 
     site   = biz.get("website", "")
     domain = _domain(site)
     pool: list[dict] = []
 
-    # Layer 1
-    raw = await _scrape_site(site)
-    for e in raw:
-        pool.append({"value": e, "first_name": "", "last_name": "",
-                     "position": "", "confidence": 60, "src": "scrape"})
+    # Layer 1: website scrape (free)
+    if site:
+        raw = await _scrape_site(site)
+        for e in raw:
+            pool.append({"value": e, "position": "", "confidence": 60, "src": "scrape"})
 
-    # Layer 2 — only if scrape found nothing
+    # Layer 2: RapidAPI email finder (free tier)
     if not pool and domain:
-        for h in await _hunter(domain):
-            pool.append({**h, "src": "hunter"})
-
-    # Layer 3 — only if still nothing
-    if not pool and domain:
-        for a in await _apollo(biz.get("name", ""), domain):
-            pool.append({**a, "src": "apollo"})
+        results = await _rapidapi_email_finder(domain, biz.get("name", ""))
+        for r in results:
+            pool.append({**r, "src": "rapidapi_email_finder"})
 
     if not pool:
         return {**biz, "enriched": False}
@@ -158,7 +143,7 @@ async def _enrich_one(biz: dict) -> dict:
         **biz,
         "emails":         [e["value"] for e in scored if e.get("value")],
         "primary_email":  best["value"],
-        "owner_name":     owner,
+        "owner_name":     owner or biz.get("owner_name", ""),
         "owner_position": best.get("position", ""),
         "enriched":       True,
     }
