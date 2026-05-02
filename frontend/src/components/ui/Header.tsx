@@ -18,11 +18,11 @@ export function Header() {
         </div>
 
         {/* Nav */}
-        <nav className="flex gap-6 text-sm text-[var(--muted)]">
+        {/* <nav className="flex gap-6 text-sm text-[var(--muted)]">
           {['Pricing', 'Docs', 'API', 'GitHub'].map(l => (
             <a key={l} href="#" className="hover:text-[var(--text)] transition-colors">{l}</a>
           ))}
-        </nav>
+        </nav> */}
       </div>
     </header>
   )
