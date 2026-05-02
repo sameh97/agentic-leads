@@ -5,7 +5,6 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# System deps needed to compile dnspython / lxml
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libxml2-dev libxslt-dev \
  && rm -rf /var/lib/apt/lists/*
@@ -22,28 +21,27 @@ FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Runtime system deps (lxml needs libxml2 at runtime)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2 libxslt1.1 curl \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy application source
 COPY . .
 
-# Create output directory for CSV/XLSX exports
-RUN mkdir -p /tmp/leads
+# Create output dir and set permissions BEFORE switching to non-root user.
+# The named Docker volume is mounted at /app/output — we need appuser (1001)
+# to own it. The 'chmod 777' ensures the volume mount point stays writable
+# even after Docker overwrites directory ownership on volume attach.
+RUN mkdir -p /app/output \
+ && useradd -m -u 1001 appuser \
+ && chown -R appuser:appuser /app \
+ && chmod 777 /app/output
 
-# Non-root user for security
-RUN useradd -m -u 1001 appuser \
- && chown -R appuser:appuser /app /tmp/leads
 USER appuser
 
 EXPOSE 8000
 
-# Health check — FastAPI /api/health endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
   CMD curl -f http://localhost:8000/api/health || exit 1
 

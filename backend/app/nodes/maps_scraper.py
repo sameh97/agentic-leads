@@ -50,23 +50,22 @@ async def _search_local_business(query: str, location: str, limit: int) -> list[
 def _normalize(r: dict) -> dict:
     """Normalize RapidAPI Local Business Data response to our schema."""
     # Email may be in top-level or nested contacts
-    emails = r.get("emails", []) or []
+    emails = r.get("emails") or []
     primary_email = emails[0] if emails else ""
 
     return {
-        "name":          r.get("name", ""),
-        "address":       r.get("full_address", "") or r.get("address", ""),
-        "phone":         r.get("phone_number", "") or r.get("phone", ""),
-        "website":       r.get("website", ""),
-        "rating":        float(r.get("rating", 0) or 0),
-        "review_count":  int(r.get("reviews", 0) or r.get("review_count", 0) or 0),
+        "name":          str(r.get("name") or ""),
+        "address":       str(r.get("full_address") or r.get("address") or ""),
+        "phone":         str(r.get("phone_number") or r.get("phone") or ""),
+        "website":       str(r.get("website") or ""),
+        "rating":        float(r.get("rating") or 0),
+        "review_count":  int(r.get("reviews") or r.get("review_count") or 0),
         "latitude":      r.get("latitude") or (r.get("coordinates") or {}).get("lat"),
         "longitude":     r.get("longitude") or (r.get("coordinates") or {}).get("lng"),
-        "category":      (r.get("subtypes") or [None])[0] or r.get("type", ""),
+        "category":      str((r.get("subtypes") or [None])[0] or r.get("type") or ""),
         "source":        "rapidapi_local_business",
-        # pre-populate email if already in response
         "emails":        emails,
-        "primary_email": primary_email,
+        "primary_email": str(primary_email),
         "owner_name":    "",
         "owner_position": "",
         "email_valid":   False,
@@ -141,10 +140,11 @@ def scrape_maps_node(state: LeadState) -> LeadState:
         logger.error(f"[maps_scraper] {e}")
         businesses = _demo_records(q, loc)
 
-    # Deduplicate
+    # Deduplicate — use str() to safely handle None name/address from API
     seen, unique = set(), []
     for b in businesses:
-        key = (b["name"].lower().strip(), b["address"].lower()[:30])
+        key = (str(b.get("name") or "").lower().strip(),
+               str(b.get("address") or "").lower()[:30])
         if key not in seen:
             seen.add(key)
             unique.append(b)

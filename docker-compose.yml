@@ -29,13 +29,20 @@ services:
     container_name: leadflow-backend
     restart: unless-stopped
 
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
 
     environment:
       # LLM
       OPENAI_API_KEY:        ${OPENAI_API_KEY}
+      LLM_MODEL:             ${LLM_MODEL}
+      LLM_PROVIDER:          ${LLM_PROVIDER:-}
 
+      OLLAMA_BASE_URL:       ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+
+      RAPIDAPI_KEY:          ${RAPIDAPI_KEY}
       # Maps scraping
       OUTSCRAPER_API_KEY:    ${OUTSCRAPER_API_KEY:-}
       GOOGLE_PLACES_API_KEY: ${GOOGLE_PLACES_API_KEY:-}
